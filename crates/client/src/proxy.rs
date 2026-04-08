@@ -1,12 +1,7 @@
 use base64::prelude::*;
-use http_body_util::Empty;
-use hyper::{body::Bytes, header};
 use hyper_util::{
-    client::legacy::{
-        Client,
-        connect::{Connected, Connection},
-    },
-    rt::{TokioExecutor, TokioIo},
+    client::legacy::connect::{Connected, Connection, proxy::Tunnel},
+    rt::TokioIo,
 };
 use std::{
     future::Future,
@@ -19,7 +14,7 @@ use tokio::{
     net::TcpStream,
 };
 use tonic::transport::{Channel, Endpoint};
-use tower::{Service, service_fn};
+use tower::Service;
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -40,60 +35,53 @@ impl HttpConnectProxyOptions {
         &self,
         endpoint: &Endpoint,
     ) -> Result<Channel, tonic::transport::Error> {
-        let proxy_options = self.clone();
-        let svc_fn = service_fn(move |uri: tonic::transport::Uri| {
-            let proxy_options = proxy_options.clone();
-            async move { proxy_options.connect(uri).await }
-        });
-        endpoint.connect_with_connector(svc_fn).await
-    }
+        // Build the proxy URI. OverrideAddrConnector ignores this URI and always
+        // connects to self.target_addr, but Tunnel needs a valid URI to pass to
+        // the inner connector's call().
+        let proxy_uri: tonic::transport::Uri = if self.target_addr.starts_with("unix:/") {
+            // Unix socket — use a placeholder URI since OverrideAddrConnector
+            // ignores the URI anyway.
+            "http://localhost".parse().unwrap()
+        } else {
+            format!("http://{}", self.target_addr)
+                .parse()
+                .unwrap_or_else(|e| {
+                    warn!(
+                        target_addr = %self.target_addr,
+                        error = %e,
+                        "Failed to parse proxy target_addr as URI, falling back to localhost"
+                    );
+                    "http://localhost".parse().unwrap()
+                })
+        };
 
-    async fn connect(
-        &self,
-        uri: tonic::transport::Uri,
-    ) -> anyhow::Result<hyper::upgrade::Upgraded> {
-        debug!("Connecting to {} via proxy at {}", uri, self.target_addr);
-        // Create CONNECT request
-        let mut req_build = hyper::Request::builder().method("CONNECT").uri(uri);
+        let connector = OverrideAddrConnector(self.target_addr.clone());
+        let mut tunnel = Tunnel::new(proxy_uri, connector);
+
         if let Some((user, pass)) = &self.basic_auth {
             let creds = BASE64_STANDARD.encode(format!("{user}:{pass}"));
-            req_build = req_build.header(header::PROXY_AUTHORIZATION, format!("Basic {creds}"));
+            let auth = http::header::HeaderValue::from_str(&format!("Basic {creds}"))
+                .expect("valid base64 produces valid header value");
+            tunnel = tunnel.with_auth(auth);
         }
-        let req = req_build.body(Empty::<Bytes>::new())?;
 
-        // We have to create a client with a specific connector because Hyper is
-        // not letting us change the HTTP/2 authority
-        let client = Client::builder(TokioExecutor::new())
-            .build(OverrideAddrConnector(self.target_addr.clone()));
-
-        // Send request
-        let res = client.request(req).await?;
-        if res.status().is_success() {
-            Ok(hyper::upgrade::on(res).await?)
-        } else {
-            Err(anyhow::anyhow!(
-                "CONNECT call failed with status: {}",
-                res.status()
-            ))
-        }
+        endpoint.connect_with_connector(tunnel).await
     }
 }
 
 #[derive(Clone)]
 struct OverrideAddrConnector(String);
 
-impl Service<hyper::Uri> for OverrideAddrConnector {
+impl Service<tonic::transport::Uri> for OverrideAddrConnector {
     type Response = TokioIo<ProxyStream>;
-
     type Error = anyhow::Error;
-
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _ctx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _uri: hyper::Uri) -> Self::Future {
+    fn call(&mut self, _uri: tonic::transport::Uri) -> Self::Future {
         let target_addr = self.0.clone();
         let fut = async move {
             Ok(TokioIo::new(
@@ -205,5 +193,136 @@ impl Connection for ProxyStream {
             #[cfg(unix)]
             ProxyStream::Unix(_) => Connected::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    struct CapturedConnect {
+        request_line: String,
+        headers: Vec<String>,
+    }
+
+    // Starts a mock TCP proxy that accepts one connection, captures the
+    // CONNECT request, and replies 200. Returns the proxy address and a
+    // handle to retrieve the captured request.
+    async fn mock_proxy() -> (String, tokio::task::JoinHandle<CapturedConnect>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).await.unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push(line.trim_end().to_string());
+            }
+            reader
+                .into_inner()
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+                .await
+                .unwrap();
+            CapturedConnect {
+                request_line,
+                headers,
+            }
+        });
+        (addr, handle)
+    }
+
+    fn make_tunnel(proxy_addr: &str) -> Tunnel<OverrideAddrConnector> {
+        let proxy_uri: tonic::transport::Uri = format!("http://{proxy_addr}").parse().unwrap();
+        Tunnel::new(proxy_uri, OverrideAddrConnector(proxy_addr.to_string()))
+    }
+
+    #[tokio::test]
+    async fn connect_includes_port_for_https() {
+        let (proxy_addr, handle) = mock_proxy().await;
+        let tunnel = make_tunnel(&proxy_addr);
+        let uri: tonic::transport::Uri = "https://example.com/some/path".parse().unwrap();
+        let _ = tower::ServiceExt::oneshot(tunnel, uri).await.unwrap();
+
+        let captured = handle.await.unwrap();
+        assert_eq!(
+            captured.request_line.trim(),
+            "CONNECT example.com:443 HTTP/1.1"
+        );
+    }
+
+    // Tunnel defaults to port 443 when no port is present in the URI, regardless
+    // of scheme, because CONNECT is almost exclusively used for TLS tunnelling.
+    #[tokio::test]
+    async fn connect_defaults_to_443_without_port() {
+        let (proxy_addr, handle) = mock_proxy().await;
+        let tunnel = make_tunnel(&proxy_addr);
+        let uri: tonic::transport::Uri = "http://example.com".parse().unwrap();
+        let _ = tower::ServiceExt::oneshot(tunnel, uri).await.unwrap();
+
+        let captured = handle.await.unwrap();
+        assert_eq!(
+            captured.request_line.trim(),
+            "CONNECT example.com:443 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_preserves_explicit_port() {
+        let (proxy_addr, handle) = mock_proxy().await;
+        let tunnel = make_tunnel(&proxy_addr);
+        let uri: tonic::transport::Uri = "https://example.com:7233".parse().unwrap();
+        let _ = tower::ServiceExt::oneshot(tunnel, uri).await.unwrap();
+
+        let captured = handle.await.unwrap();
+        assert_eq!(
+            captured.request_line.trim(),
+            "CONNECT example.com:7233 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_includes_basic_auth() {
+        let (proxy_addr, handle) = mock_proxy().await;
+        let creds = BASE64_STANDARD.encode("user:pass");
+        let auth = http::header::HeaderValue::from_str(&format!("Basic {creds}")).unwrap();
+        let tunnel = make_tunnel(&proxy_addr).with_auth(auth);
+        let uri: tonic::transport::Uri = "https://example.com:7233".parse().unwrap();
+        let _ = tower::ServiceExt::oneshot(tunnel, uri).await.unwrap();
+
+        let captured = handle.await.unwrap();
+        let auth_header = captured
+            .headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("proxy-authorization:"))
+            .expect("missing proxy-authorization header");
+        assert_eq!(
+            auth_header.trim(),
+            format!("Proxy-Authorization: Basic {creds}")
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_host_header_matches_target() {
+        let (proxy_addr, handle) = mock_proxy().await;
+        let tunnel = make_tunnel(&proxy_addr);
+        let uri: tonic::transport::Uri = "https://example.com:7233".parse().unwrap();
+        let _ = tower::ServiceExt::oneshot(tunnel, uri).await.unwrap();
+
+        let captured = handle.await.unwrap();
+        let host = captured
+            .headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("host:"))
+            .expect("missing host header");
+        assert_eq!(host.trim(), "Host: example.com:7233");
     }
 }
